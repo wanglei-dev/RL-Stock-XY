@@ -3,7 +3,7 @@ import pickle
 import pandas as pd
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3 import PPO
-from rlenv.StockTradingEnv0 import StockTradingEnv
+from rlenv.StockTradingEnv0 import StockTradingEnv, INITIAL_ACCOUNT_BALANCE
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
@@ -13,19 +13,53 @@ plt.rcParams['axes.unicode_minus'] = False
 
 def stock_trade(stock_file):
     day_profits = []
+    print("train-file", stock_file)
     df = pd.read_csv(stock_file)
     df = df.sort_values('date')
+    
+    # 数据预处理：处理缺失值和异常值
+    # 填充缺失的数值列
+    numeric_columns = ['peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'turn']
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = df[col].fillna(df[col].median())
+    
+    # 处理成交量和成交额为0的情况
+    df['volume'] = df['volume'].replace(0, df['volume'].median())
+    df['amount'] = df['amount'].replace(0, df['amount'].median())
+    
+    print("shape after preprocessing", df.shape)
 
     # The algorithms require a vectorized environment to run
     env = DummyVecEnv([lambda: StockTradingEnv(df)])
 
-    model = PPO("MlpPolicy", env, verbose=0, tensorboard_log='./log')
-    model.learn(total_timesteps=int(1e4))
+    # 使用更稳定的PPO参数
+    model = PPO("MlpPolicy", env, 
+                verbose=1, 
+                tensorboard_log='./log',
+                learning_rate=3e-4,
+                n_steps=2048,
+                batch_size=64,
+                n_epochs=10,
+                gamma=0.99,
+                gae_lambda=0.95,
+                clip_range=0.2,
+                ent_coef=0.01,
+                policy_kwargs=dict(net_arch=[dict(pi=[64, 64], vf=[64, 64])]))
+    
+    model.learn(total_timesteps=int(1e4)) 
+    # 训练 10000 步，batch_size=64, 10000/64=156.25, 大约每个数据点训练156次
 
     # 尝试使用测试数据，如果不存在则使用训练数据进行评估
     test_file = stock_file.replace('train', 'test')
     if os.path.exists(test_file):
         df_test = pd.read_csv(test_file)
+        # 对测试数据也进行相同的预处理
+        for col in numeric_columns:
+            if col in df_test.columns:
+                df_test[col] = df_test[col].fillna(df_test[col].median())
+        df_test['volume'] = df_test['volume'].replace(0, df_test['volume'].median())
+        df_test['amount'] = df_test['amount'].replace(0, df_test['amount'].median())
     else:
         print(f"Test file not found: {test_file}, using training data for evaluation")
         df_test = df  # 使用训练数据
@@ -38,7 +72,7 @@ def stock_trade(stock_file):
         action, _states = model.predict(obs, deterministic=True)
         obs, rewards, done, info = env.step(action)
         current_env = env.envs[0]  # 获取第一个环境实例
-        profit = current_env.net_worth - 10000  # INITIAL_ACCOUNT_BALANCE = 10000
+        profit = current_env.net_worth - INITIAL_ACCOUNT_BALANCE  # 使用正确的常量
         day_profits.append(profit)
         
         if done:
@@ -47,9 +81,10 @@ def stock_trade(stock_file):
 
 
 def find_file(path, name):
-    # print(path, name)
+    print(path, name)
     for root, dirs, files in os.walk(path):
         for fname in files:
+            print("found file", fname)
             if name in fname:
                 return os.path.join(root, fname)
 

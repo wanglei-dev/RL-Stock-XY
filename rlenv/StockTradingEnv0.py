@@ -2,6 +2,7 @@ import random
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+import pandas as pd
 
 MAX_ACCOUNT_BALANCE = 2147483647
 MAX_NUM_SHARES = 2147483647
@@ -34,58 +35,82 @@ class StockTradingEnv(gym.Env):
             low=0, high=1, shape=(19,), dtype=np.float16)
 
     def _next_observation(self):
-        # 获取当前时间步的状态特征
+        # 获取当前时间步的状态特征，确保数值稳定性
+        def safe_normalize(value, max_val, default=0.0):
+            """安全的归一化函数，处理NaN和除零情况"""
+            if pd.isna(value) or max_val == 0:
+                return default
+            return np.clip(value / max_val, 0, 1)
+        
+        # 获取当前行数据
+        current_data = self.df.iloc[self.current_step]
+        
         obs = np.array([
-            self.df.loc[self.current_step, 'open'] / MAX_SHARE_PRICE,  # 开盘价归一化
-            self.df.loc[self.current_step, 'high'] / MAX_SHARE_PRICE,  # 最高价归一化
-            self.df.loc[self.current_step, 'low'] / MAX_SHARE_PRICE,   # 最低价归一化
-            self.df.loc[self.current_step, 'close'] / MAX_SHARE_PRICE, # 收盘价归一化
-            self.df.loc[self.current_step, 'volume'] / MAX_VOLUME,     # 成交量归一化
-            self.df.loc[self.current_step, 'amount'] / MAX_AMOUNT,     # 成交额归一化
-            self.df.loc[self.current_step, 'adjustflag'] / 10,         # 复权标志
-            self.df.loc[self.current_step, 'tradestatus'] / 1,         # 交易状态
-            self.df.loc[self.current_step, 'pctChg'] / 100,            # 涨跌幅百分比
-            self.df.loc[self.current_step, 'peTTM'] / 1e4,             # 市盈率
-            self.df.loc[self.current_step, 'pbMRQ'] / 100,             # 市净率
-            self.df.loc[self.current_step, 'psTTM'] / 100,             # 市销率
-            self.df.loc[self.current_step, 'pctChg'] / 1e3,            # 涨跌幅缩放
-            self.balance / MAX_ACCOUNT_BALANCE,                        # 当前资金归一化
-            self.max_net_worth / MAX_ACCOUNT_BALANCE,                  # 最大净值归一化
-            self.shares_held / MAX_NUM_SHARES,                         # 持有股票数量归一化
-            self.cost_basis / MAX_SHARE_PRICE,                         # 持仓成本归一化
-            self.total_shares_sold / MAX_NUM_SHARES,                   # 卖出股票数量归一化
-            self.total_sales_value / (MAX_NUM_SHARES * MAX_SHARE_PRICE),# 卖出总金额归一化
-        ])
+            safe_normalize(current_data['open'], MAX_SHARE_PRICE),      # 开盘价归一化
+            safe_normalize(current_data['high'], MAX_SHARE_PRICE),      # 最高价归一化
+            safe_normalize(current_data['low'], MAX_SHARE_PRICE),       # 最低价归一化
+            safe_normalize(current_data['close'], MAX_SHARE_PRICE),     # 收盘价归一化
+            safe_normalize(current_data['volume'], MAX_VOLUME),         # 成交量归一化
+            safe_normalize(current_data['amount'], MAX_AMOUNT),         # 成交额归一化
+            safe_normalize(current_data['adjustflag'], 10),             # 复权标志
+            safe_normalize(current_data['tradestatus'], 1),             # 交易状态
+            safe_normalize(current_data['pctChg'], 100),                # 涨跌幅百分比
+            safe_normalize(current_data.get('peTTM', 0), 1e4),          # 市盈率
+            safe_normalize(current_data.get('pbMRQ', 0), 100),          # 市净率
+            safe_normalize(current_data.get('psTTM', 0), 100),          # 市销率
+            safe_normalize(current_data['pctChg'], 1e3),                # 涨跌幅缩放
+            safe_normalize(self.balance, MAX_ACCOUNT_BALANCE),          # 当前资金归一化
+            safe_normalize(self.max_net_worth, MAX_ACCOUNT_BALANCE),    # 最大净值归一化
+            safe_normalize(self.shares_held, MAX_NUM_SHARES),           # 持有股票数量归一化
+            safe_normalize(self.cost_basis, MAX_SHARE_PRICE),           # 持仓成本归一化
+            safe_normalize(self.total_shares_sold, MAX_NUM_SHARES),     # 卖出股票数量归一化
+            safe_normalize(self.total_sales_value, MAX_NUM_SHARES * MAX_SHARE_PRICE), # 卖出总金额归一化
+        ], dtype=np.float32)
+        
+        # 确保观察值中没有NaN或无穷值
+        obs = np.nan_to_num(obs, nan=0.0, posinf=1.0, neginf=0.0)
         return obs
 
     def _take_action(self, action):
         # 根据智能体动作执行买入/卖出操作
         # 在当前时间步内，随机选取一个价格作为成交价
-        current_price = random.uniform(
-            self.df.loc[self.current_step, "open"], self.df.loc[self.current_step, "close"])
+        current_data = self.df.iloc[self.current_step]
+        
+        # 确保价格数据有效
+        open_price = current_data['open'] if not pd.isna(current_data['open']) else current_data['close']
+        close_price = current_data['close'] if not pd.isna(current_data['close']) else open_price
+        
+        if open_price <= 0 or close_price <= 0:
+            return  # 如果价格无效，跳过这一步
+            
+        current_price = random.uniform(min(open_price, close_price), max(open_price, close_price))
 
         action_type = action[0]  # 动作类型：0-买入，1-卖出，2-持有
-        amount = action[1]       # 操作比例
+        amount = np.clip(action[1], 0, 1)  # 确保操作比例在[0,1]范围内
 
-        if action_type < 1:
+        if action_type < 1 and self.balance > 0:
             # 买入：用余额的一定比例买入股票
             total_possible = int(self.balance / current_price)  # 最多可以买多少股
             shares_bought = int(total_possible * amount)        # 实际买入股数
-            prev_cost = self.cost_basis * self.shares_held      # 之前持仓成本
-            additional_cost = shares_bought * current_price     # 新买入成本
+            
+            if shares_bought > 0:
+                prev_cost = self.cost_basis * self.shares_held      # 之前持仓成本
+                additional_cost = shares_bought * current_price     # 新买入成本
 
-            self.balance -= additional_cost                    # 扣除买入金额
-            self.cost_basis = (
-                prev_cost + additional_cost) / (self.shares_held + shares_bought)  # 更新持仓成本
-            self.shares_held += shares_bought                  # 更新持有股数
+                self.balance -= additional_cost                    # 扣除买入金额
+                self.cost_basis = (
+                    prev_cost + additional_cost) / (self.shares_held + shares_bought)  # 更新持仓成本
+                self.shares_held += shares_bought                  # 更新持有股数
 
-        elif action_type < 2:
+        elif action_type < 2 and self.shares_held > 0:
             # 卖出：用持有股票的一定比例卖出
             shares_sold = int(self.shares_held * amount)       # 卖出股数
-            self.balance += shares_sold * current_price        # 增加卖出金额
-            self.shares_held -= shares_sold                    # 更新持有股数
-            self.total_shares_sold += shares_sold              # 累计卖出股数
-            self.total_sales_value += shares_sold * current_price # 累计卖出金额
+            
+            if shares_sold > 0:
+                self.balance += shares_sold * current_price        # 增加卖出金额
+                self.shares_held -= shares_sold                    # 更新持有股数
+                self.total_shares_sold += shares_sold              # 累计卖出股数
+                self.total_sales_value += shares_sold * current_price # 累计卖出金额
 
         # 更新净资产
         self.net_worth = self.balance + self.shares_held * current_price
@@ -106,23 +131,22 @@ class StockTradingEnv(gym.Env):
 
         self.current_step += 1  # 时间步前进
 
-        # 如果到达数据末尾，循环训练（可根据需要改为 done=True）
-        if self.current_step > len(self.df.loc[:, 'open'].values) - 1:
-            self.current_step = 0  # 循环训练
-            # done = True
+        # 如果到达数据末尾，结束回合
+        if self.current_step >= len(self.df) - 1:
+            done = True
+            self.current_step = len(self.df) - 1  # 防止越界
 
-        delay_modifier = (self.current_step / MAX_STEPS)  # 可用于奖励修正
+        # 计算更稳定的奖励函数
+        profit_ratio = (self.net_worth - INITIAL_ACCOUNT_BALANCE) / INITIAL_ACCOUNT_BALANCE
+        reward = np.tanh(profit_ratio)  # 使用tanh函数限制奖励范围在[-1, 1]
 
-        # 奖励函数：当前净资产与初始资金的差值
-        reward = self.net_worth - INITIAL_ACCOUNT_BALANCE
-        reward = 1 if reward > 0 else -100  # 简化奖励（可自定义）
-
-        # 如果净资产为负，回合结束
-        if self.net_worth <= 0:
+        # 如果净资产为负或过低，给予惩罚并结束回合
+        if self.net_worth <= INITIAL_ACCOUNT_BALANCE * 0.1:  # 如果净资产低于初始资金的10%
+            reward = -1.0
             done = True
 
         obs = self._next_observation()  # 新状态
-        info = {}  # 可扩展信息
+        info = {'net_worth': self.net_worth, 'balance': self.balance, 'shares_held': self.shares_held}
 
         return obs, reward, done, truncated, info
 
