@@ -1,17 +1,13 @@
 import os
 import pickle
 import pandas as pd
-from stable_baselines.common.policies import MlpPolicy
-from stable_baselines.common.vec_env import DummyVecEnv
-from stable_baselines import PPO2
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3 import PPO
 from rlenv.StockTradingEnv0 import StockTradingEnv
-
-import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
 font = fm.FontProperties(fname='font/wqy-microhei.ttc')
-# plt.rc('font', family='Source Han Sans CN')
 plt.rcParams['axes.unicode_minus'] = False
 
 
@@ -23,18 +19,28 @@ def stock_trade(stock_file):
     # The algorithms require a vectorized environment to run
     env = DummyVecEnv([lambda: StockTradingEnv(df)])
 
-    model = PPO2(MlpPolicy, env, verbose=0, tensorboard_log='./log')
+    model = PPO("MlpPolicy", env, verbose=0, tensorboard_log='./log')
     model.learn(total_timesteps=int(1e4))
 
-    df_test = pd.read_csv(stock_file.replace('train', 'test'))
+    # 尝试使用测试数据，如果不存在则使用训练数据进行评估
+    test_file = stock_file.replace('train', 'test')
+    if os.path.exists(test_file):
+        df_test = pd.read_csv(test_file)
+    else:
+        print(f"Test file not found: {test_file}, using training data for evaluation")
+        df_test = df  # 使用训练数据
+
+    print("test-file", test_file, "shape", df_test.shape)
 
     env = DummyVecEnv([lambda: StockTradingEnv(df_test)])
     obs = env.reset()
     for i in range(len(df_test) - 1):
-        action, _states = model.predict(obs)
+        action, _states = model.predict(obs, deterministic=True)
         obs, rewards, done, info = env.step(action)
-        profit = env.render()
+        current_env = env.envs[0]  # 获取第一个环境实例
+        profit = current_env.net_worth - 10000  # INITIAL_ACCOUNT_BALANCE = 10000
         day_profits.append(profit)
+        
         if done:
             break
     return day_profits
@@ -52,14 +58,23 @@ def test_a_stock_trade(stock_code):
     stock_file = find_file('./stockdata/train', str(stock_code))
 
     daily_profits = stock_trade(stock_file)
+    print(f"Daily profits data: {daily_profits[:10]}...")  # 打印前10个数据点
+    print(f"Total data points: {len(daily_profits)}")
+    print(f"Data range: min={min(daily_profits) if daily_profits else 'N/A'}, max={max(daily_profits) if daily_profits else 'N/A'}")
+    
+    if not daily_profits:
+        print("Warning: No profit data to plot!")
+        return
+        
     fig, ax = plt.subplots()
-    ax.plot(daily_profits, '-o', label=stock_code, marker='o', ms=10, alpha=0.7, mfc='orange')
+    ax.plot(daily_profits, marker='o', label=stock_code, ms=10, alpha=0.7, mfc='orange')
     ax.grid()
     plt.xlabel('step')
     plt.ylabel('profit')
     ax.legend(prop=font)
     # plt.show()
     plt.savefig(f'./img/{stock_code}.png')
+    print(f"Graph saved to ./img/{stock_code}.png")
 
 
 def multi_stock_trade():

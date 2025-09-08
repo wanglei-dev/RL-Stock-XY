@@ -15,7 +15,7 @@ class Downloader(object):
     def __init__(self,
                  output_dir,
                  date_start='1990-01-01',
-                 date_end='2020-03-23'):
+                 date_end='2025-09-08'):
         self._bs = bs
         bs.login()
         self.date_start = date_start
