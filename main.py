@@ -4,11 +4,17 @@ import pandas as pd
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3 import PPO
 from rlenv.StockTradingEnv0 import StockTradingEnv, INITIAL_ACCOUNT_BALANCE
+from evaluation import analyze_trades, plot_profit_curve, plot_trade_points, save_trade_and_analysis
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 
 font = fm.FontProperties(fname='font/wqy-microhei.ttc')
 plt.rcParams['axes.unicode_minus'] = False
+
+SEED = 42
+HISTORY_WINDOW = 7
+REWARD_WINDOW = 20
+REWARD_WEIGHTS = {'ret': 1.0, 'dd': 0.5, 'vol': 0.2}
 
 
 def stock_trade(stock_file):
@@ -16,22 +22,28 @@ def stock_trade(stock_file):
     print("train-file", stock_file)
     df = pd.read_csv(stock_file)
     df = df.sort_values('date')
-    
+
     # 数据预处理：处理缺失值和异常值
-    # 填充缺失的数值列
     numeric_columns = ['peTTM', 'pbMRQ', 'psTTM', 'pcfNcfTTM', 'turn']
     for col in numeric_columns:
         if col in df.columns:
             df[col] = df[col].fillna(df[col].median())
-    
-    # 处理成交量和成交额为0的情况
-    df['volume'] = df['volume'].replace(0, df['volume'].median())
-    df['amount'] = df['amount'].replace(0, df['amount'].median())
-    
+    if 'volume' in df.columns:
+        df['volume'] = df['volume'].replace(0, df['volume'].median())
+    if 'amount' in df.columns:
+        df['amount'] = df['amount'].replace(0, df['amount'].median())
+
     print("shape after preprocessing", df.shape)
 
     # The algorithms require a vectorized environment to run
-    env = DummyVecEnv([lambda: StockTradingEnv(df)])
+    env = DummyVecEnv([lambda: StockTradingEnv(
+        df,
+        debug=False,
+        history_window=HISTORY_WINDOW,
+        reward_window=REWARD_WINDOW,
+        reward_weights=REWARD_WEIGHTS
+    )])
+    env.reset()
 
     # 使用更稳定的PPO参数
     model = PPO("MlpPolicy", env, 
@@ -45,7 +57,8 @@ def stock_trade(stock_file):
                 gae_lambda=0.95,
                 clip_range=0.2,
                 ent_coef=0.01,
-                policy_kwargs=dict(net_arch=[dict(pi=[64, 64], vf=[64, 64])]))
+                policy_kwargs=dict(net_arch=[dict(pi=[64, 64], vf=[64, 64])]),
+                seed=SEED)
     
     model.learn(total_timesteps=int(1e4)) 
     # 训练 10000 步，batch_size=64, 10000/64=156.25, 大约每个数据点训练156次
@@ -58,26 +71,46 @@ def stock_trade(stock_file):
         for col in numeric_columns:
             if col in df_test.columns:
                 df_test[col] = df_test[col].fillna(df_test[col].median())
-        df_test['volume'] = df_test['volume'].replace(0, df_test['volume'].median())
-        df_test['amount'] = df_test['amount'].replace(0, df_test['amount'].median())
+        if 'volume' in df_test.columns:
+            df_test['volume'] = df_test['volume'].replace(0, df_test['volume'].median())
+        if 'amount' in df_test.columns:
+            df_test['amount'] = df_test['amount'].replace(0, df_test['amount'].median())
     else:
         print(f"Test file not found: {test_file}, using training data for evaluation")
         df_test = df  # 使用训练数据
 
     print("test-file", test_file, "shape", df_test.shape)
 
-    env = DummyVecEnv([lambda: StockTradingEnv(df_test)])
+    env = DummyVecEnv([lambda: StockTradingEnv(
+        df_test,
+        debug=True,
+        history_window=HISTORY_WINDOW,
+        reward_window=REWARD_WINDOW,
+        reward_weights=REWARD_WEIGHTS
+    )])
     obs = env.reset()
+    
+    collected_trades = []
     for i in range(len(df_test) - 1):
-        action, _states = model.predict(obs, deterministic=True)
-        obs, rewards, done, info = env.step(action)
-        current_env = env.envs[0]  # 获取第一个环境实例
-        profit = current_env.net_worth - INITIAL_ACCOUNT_BALANCE  # 使用正确的常量
+        action, _states = model.predict(obs, deterministic=False)
+        obs, rewards, dones, infos = env.step(action)  # VecEnv: step 返回 (obs, rewards, dones, infos)
+        current_env = env.envs[0]
+        profit = current_env.net_worth - INITIAL_ACCOUNT_BALANCE
         day_profits.append(profit)
-        
-        if done:
+        if 'last_trade' in infos[0]:
+            collected_trades.append(infos[0]['last_trade'])
+        if i < 30:
+            print(f"step={i}, action={action}, balance={current_env.balance:.2f}, shares={current_env.shares_held}")
+        if dones[0]:
             break
-    return day_profits
+    if collected_trades:
+        trade_log = collected_trades
+    else:
+        try:
+            trade_log = env.env_method('get_trade_log')[0]
+        except Exception:
+            trade_log = env.get_attr('trade_log')[0]
+    return day_profits, trade_log, df_test
 
 
 def find_file(path, name):
@@ -91,25 +124,29 @@ def find_file(path, name):
 
 def test_a_stock_trade(stock_code):
     stock_file = find_file('./stockdata/train', str(stock_code))
-
-    daily_profits = stock_trade(stock_file)
-    print(f"Daily profits data: {daily_profits[:10]}...")  # 打印前10个数据点
-    print(f"Total data points: {len(daily_profits)}")
-    print(f"Data range: min={min(daily_profits) if daily_profits else 'N/A'}, max={max(daily_profits) if daily_profits else 'N/A'}")
-    
-    if not daily_profits:
-        print("Warning: No profit data to plot!")
+    day_profits, trade_log, df_test = stock_trade(stock_file)
+    print(f"Daily profits data (head): {day_profits[:10]} (total={len(day_profits)})")
+    if not day_profits:
+        print("Warning: No profit data to plot! Abort visualization.")
         return
-        
-    fig, ax = plt.subplots()
-    ax.plot(daily_profits, marker='o', label=stock_code, ms=10, alpha=0.7, mfc='orange')
-    ax.grid()
-    plt.xlabel('step')
-    plt.ylabel('profit')
-    ax.legend(prop=font)
-    # plt.show()
-    plt.savefig(f'./img/{stock_code}.png')
-    print(f"Graph saved to ./img/{stock_code}.png")
+
+    out_dir = './img'
+    # 利润曲线
+    profit_path = plot_profit_curve(day_profits, stock_code, out_dir)
+    print(f"Profit curve saved: {profit_path}")
+
+    # 交易点与分析
+    if 'close' in df_test.columns:
+        price = df_test['close']
+        trade_img, trade_csv = plot_trade_points(price, trade_log, stock_code, out_dir)
+        if trade_img:
+            print(f"Trade point image saved: {trade_img}")
+            print(f"Trade log csv saved: {trade_csv}")
+            summary = save_trade_and_analysis(stock_code, trade_log, price, out_dir, analyze_trades)
+            if summary:
+                print('Summary:', summary)
+        else:
+            print('No trade points to plot or empty trade log.')
 
 
 def multi_stock_trade():
@@ -122,8 +159,8 @@ def multi_stock_trade():
         stock_file = find_file('./stockdata/train', str(code))
         if stock_file:
             try:
-                profits = stock_trade(stock_file)
-                group_result.append(profits)
+                profits, trade_log, df_used = stock_trade(stock_file)
+                group_result.append((profits, trade_log))
             except Exception as err:
                 print(err)
 
@@ -133,7 +170,7 @@ def multi_stock_trade():
 
 if __name__ == '__main__':
     # multi_stock_trade()
-    test_a_stock_trade('sh.600036')
+    test_a_stock_trade('sz.002230.科大讯飞.csv')
     # ret = find_file('./stockdata/train', '600036')
     # print(ret)
 
